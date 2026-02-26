@@ -40,11 +40,24 @@ OUT_H = INPUT_H
 OUT_W = INPUT_W
 
 BATCH_SIZE   = 8
-EPOCHS       = 3
+EPOCHS       = 30
 STEPS_EPOCH  = 244   # ceil(1950 train samples / batch 8)
 VAL_STEPS    = 13    # ceil(100 test samples / batch 8)
 
-MODEL_SAVE_PATH = "Akida/rfi_seg_akida.keras"
+MODEL_SAVE_ROOT = "Models/V2/"
+MODEL_SAVE_NAME = "Akida_v2.keras"
+
+# Sample image saving
+# Set SAVE_SAMPLES = True to save visualisation PNGs after training.
+# Each PNG shows: [Input | Ground Truth | CNN Prediction | Difference]
+# Difference colour key: TP=green, FP=red, FN=yellow, TN=black.
+SAVE_SAMPLES = True
+N_SAMPLES    = 8
+SAMPLES_DIR  = os.path.join(MODEL_SAVE_ROOT,"Samples/CNN")
+os.makedirs(SAMPLES_DIR,exist_ok=True)
+
+# TensorBoard
+LOG_DIR = os.path.join(MODEL_SAVE_ROOT, "logs")   # Models/V2/logs/
 
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
@@ -52,7 +65,7 @@ MODEL_SAVE_PATH = "Akida/rfi_seg_akida.keras"
 def _load_split_generator(root, split_name, out_h, out_w):
     """
     Yields (spectrogram, mask) pairs.
-      spectrogram: (INPUT_H, INPUT_W, 1) float32, values 0-255
+      spectrogram: (INPUT_H, INPUT_W, 1) float32, values 0-1
       mask:        (out_h, out_w) int32, values 0 or 1
     Masks are resized from INPUT_H x INPUT_W to out_h x out_w (nearest-neighbour)
     to match the network output resolution.
@@ -64,8 +77,6 @@ def _load_split_generator(root, split_name, out_h, out_w):
 
     for fname in filenames:
         # Spectrogram: grayscale uint8 -> float32 normalised to [0, 1]
-        # (Rescaling is NOT in the model; normalise here so training and
-        #  Akida inference via input_scaling=(255,0) see the same range)
         spec = np.array(
             Image.open(os.path.join(spec_dir, fname)).convert("L"),
             dtype=np.float32
@@ -148,18 +159,9 @@ def build_model(in_h=INPUT_H, in_w=INPUT_W):
     # so Akida applies the division at inference time.
 
     # ── Stem ───────────────────────────────────────────────────────────────────
-    # stem1: regular 3x3 conv.
-    # dilation_rate>1, Conv2DTranspose, and Add are all rejected by cnn2snn's
-    # Keras pathway. A plain Conv2D is the only compatible option here.
     x = conv_bn_relu(inp, 32, 3, name="stem1")
-
-    # stem2: regular 3x3 conv
     x = conv_bn_relu(x, 32, 3, name="stem2")
-
-    # stem3: regular 3x3 conv (depthwise also unsupported in conversion)
     x = conv_bn_relu(x, 32, 3, name="stem3")
-
-    # stem4: pointwise 1x1 (channel reduction 32 -> 8)
     x = conv_bn_relu(x, 8, 1, name="stem4")
 
     # ── IEM Blocks (channel config matches Lava network.py) ───────────────────
@@ -188,10 +190,110 @@ def weighted_loss(y_true, y_pred):
     return tf.reduce_mean(ce * w)
 
 
+# ── Metrics Callback ───────────────────────────────────────────────────────────
+
+class SegMetricsCallback(tf.keras.callbacks.Callback):
+    """Computes per-epoch TP/FP/TN/FN/Precision/Recall/F1 on validation set."""
+
+    def __init__(self, val_dataset, val_steps, log_dir):
+        super().__init__()
+        self.val_dataset = val_dataset
+        self.val_steps   = val_steps
+        os.makedirs(log_dir, exist_ok=True)
+        self._writer = tf.summary.create_file_writer(
+            os.path.join(log_dir, "val_custom")
+        )
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        tp = fp = tn = fn = 0
+
+        for x_batch, y_batch in self.val_dataset.take(self.val_steps):
+            logits = self.model(x_batch, training=False)   # (B, H, W, 2)
+            preds  = tf.argmax(logits, axis=-1)            # (B, H, W) int64
+            labels = tf.cast(y_batch, tf.int64)
+
+            p = tf.reshape(preds,  [-1])
+            l = tf.reshape(labels, [-1])
+            tp += int(tf.reduce_sum(tf.cast((p == 1) & (l == 1), tf.int32)))
+            fp += int(tf.reduce_sum(tf.cast((p == 1) & (l == 0), tf.int32)))
+            tn += int(tf.reduce_sum(tf.cast((p == 0) & (l == 0), tf.int32)))
+            fn += int(tf.reduce_sum(tf.cast((p == 0) & (l == 1), tf.int32)))
+
+        precision = tp / (tp + fp + 1e-7)
+        recall    = tp / (tp + fn + 1e-7)
+        f1        = 2 * precision * recall / (precision + recall + 1e-7)
+
+        with self._writer.as_default():
+            tf.summary.scalar("precision", precision, step=epoch)
+            tf.summary.scalar("recall",    recall,    step=epoch)
+            tf.summary.scalar("f1",        f1,        step=epoch)
+            tf.summary.scalar("tp",        tp,        step=epoch)
+            tf.summary.scalar("fp",        fp,        step=epoch)
+            tf.summary.scalar("tn",        tn,        step=epoch)
+            tf.summary.scalar("fn",        fn,        step=epoch)
+        self._writer.flush()
+
+        print(f"  [Metrics] loss={logs.get('val_loss', float('nan')):.4f}  "
+              f"acc={logs.get('val_pix_acc', float('nan')):.4f}  "
+              f"P={precision:.4f}  R={recall:.4f}  F1={f1:.4f}  "
+              f"TP={tp}  FP={fp}  FN={fn}")
+
+
+# ── Visualisation ──────────────────────────────────────────────────────────────
+
+def save_sample_images(specs, masks, preds, save_dir, prefix="sample"):
+    """
+    Save one PNG per sample showing:
+      [Input spectrogram | Ground-truth mask | Prediction | Difference]
+    Difference colour key: TP=green, FP=red, FN=yellow, TN=black.
+
+    specs: (N, H, W, 1) float32 [0, 1]
+    masks: (N, H, W)    int32
+    preds: (N, H, W)    int
+    """
+    import matplotlib.pyplot as plt
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    for i in range(len(specs)):
+        spec_img = specs[i, :, :, 0]
+        mask     = masks[i]
+        pred     = preds[i]
+
+        diff = np.zeros((*mask.shape, 3), dtype=np.float32)
+        diff[(pred == 1) & (mask == 1)] = [0.0, 1.0, 0.0]  # TP green
+        diff[(pred == 1) & (mask == 0)] = [1.0, 0.0, 0.0]  # FP red
+        diff[(pred == 0) & (mask == 1)] = [1.0, 1.0, 0.0]  # FN yellow
+
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+        axes[0].imshow(spec_img, cmap="viridis")
+        axes[0].set_title("Input")
+        axes[0].axis("off")
+
+        axes[1].imshow(mask, cmap="gray", vmin=0, vmax=1)
+        axes[1].set_title("Ground Truth")
+        axes[1].axis("off")
+
+        axes[2].imshow(pred, cmap="gray", vmin=0, vmax=1)
+        axes[2].set_title("Prediction")
+        axes[2].axis("off")
+
+        axes[3].imshow(diff)
+        axes[3].set_title("Diff  (TP=G  FP=R  FN=Y)")
+        axes[3].axis("off")
+
+        plt.tight_layout()
+        out_path = os.path.join(save_dir, f"{prefix}_{i:03d}.png")
+        plt.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"  Saved {out_path}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"Input:  {INPUT_H}x{INPUT_W}  ->  Output: {OUT_H}x{OUT_W} (after stem1 upsample)")
+    print(f"Input:  {INPUT_H}x{INPUT_W}  ->  Output: {OUT_H}x{OUT_W}")
     print(f"Dataset: {DATASET_ROOT}")
 
     train_ds = make_dataset(
@@ -209,16 +311,50 @@ def main():
     )
     model.summary()
 
+    callbacks = [
+        tf.keras.callbacks.TensorBoard(
+            log_dir=LOG_DIR,
+            histogram_freq=0,
+            write_graph=False,
+            update_freq="epoch",
+        ),
+        SegMetricsCallback(
+            val_dataset=val_ds,
+            val_steps=VAL_STEPS,
+            log_dir=LOG_DIR,
+        ),
+    ]
+
     model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=EPOCHS,
         steps_per_epoch=STEPS_EPOCH,
         validation_steps=VAL_STEPS,
+        callbacks=callbacks,
     )
 
-    model.save(MODEL_SAVE_PATH)
-    print(f"\nSaved trained model to {MODEL_SAVE_PATH}")
+    os.makedirs(MODEL_SAVE_ROOT, exist_ok=True)
+    save_path = os.path.join(MODEL_SAVE_ROOT, MODEL_SAVE_NAME)
+    model.save(save_path)
+    print(f"\nSaved trained model to {save_path}")
+
+    if SAVE_SAMPLES:
+        print(f"\nGenerating {N_SAMPLES} sample images ...")
+        gen = _load_split_generator(DATASET_ROOT, TEST_SPLIT, OUT_H, OUT_W)
+        sample_specs, sample_masks = [], []
+        for spec, mask in gen:
+            sample_specs.append(spec)
+            sample_masks.append(mask)
+            if len(sample_specs) >= N_SAMPLES:
+                break
+
+        x = np.array(sample_specs, dtype=np.float32)   # (N, H, W, 1)
+        y = np.array(sample_masks, dtype=np.int32)      # (N, H, W)
+        logits = model.predict(x)                       # (N, H, W, 2)
+        preds  = np.argmax(logits, axis=-1)             # (N, H, W)
+
+        save_sample_images(x, y, preds, SAMPLES_DIR, prefix="cnn")
 
 
 if __name__ == "__main__":
