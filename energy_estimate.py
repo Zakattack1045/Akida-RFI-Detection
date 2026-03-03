@@ -42,7 +42,10 @@ ACTIV_BITS = 4
 # Energy per operation (Joules) — adjust to explore sensitivity.
 E_MAC_FP32 = 4.60e-12   # FP32 multiply-accumulate (Horowitz 2014)
 E_MAC_INT8 = 0.47e-12   # INT8 multiply-accumulate (Horowitz 2014)
-E_SYN      = 0.90e-12   # Neuromorphic synaptic operation (Merolla et al. 2014)
+E_SYN      = 3e-12    # (Akida)
+# E_SYN      = 26e-12   # Neuromorphic synaptic operation (IBM True North) (Merolla et al. 2014)
+# E_SYN      = 23.6e-12   # (Lava)
+
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -299,7 +302,9 @@ def print_report(conv_layers, macs, synops_rate, synops_latency, activ_bits, n_e
     print(f"  CNN (FP32, theoretical):      {_uj(e_fp32_theory):<14}  [MACs × {E_MAC_FP32*1e12:.2f} pJ]")
     print(f"  CNN (INT8, theoretical):      {_uj(e_int8_theory):<14}  [MACs × {E_MAC_INT8*1e12:.2f} pJ]")
     print(f"  SNN (rate-coded estimate):    {_uj(e_snn_rate):<14}  [SynOps_rate × {E_SYN*1e12:.2f} pJ]  ← value = spike count")
+    print(f"    including neuron updates:   {_uj(e_snn_rate*3):<14}  [E_update = 2 × E_syn, assuming 1 timestep per inference]")
     print(f"  SNN (latency-coded estimate): {_uj(e_snn_lat):<14}  [SynOps_lat  × {E_SYN*1e12:.2f} pJ]  ← one spike per non-zero neuron")
+    print(f"    including neuron updates:   {_uj(e_snn_lat*3):<14}  [E_update = 2 × E_syn, assuming 1 timestep per inference]")
 
     print(f"\n{'─ Efficiency Ratios ':-<{W}}")
     for label, e_snn in (("rate-coded  ", e_snn_rate), ("latency-coded", e_snn_lat)):
