@@ -3,6 +3,8 @@ matplotlib
 mediapy
 scikit-learn
 accelerate
+tf2onnx >= 1.16
+onnx==1.16.2
 
 # Akida packages
 akida ~= 2.18.2
