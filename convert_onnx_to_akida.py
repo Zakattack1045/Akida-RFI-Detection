@@ -165,7 +165,7 @@ def evaluate(akida_model, test_pairs):
         tn += ((pred == 0) & (y_true == 0)).sum()
         fn += ((pred == 0) & (y_true == 1)).sum()
 
-        if SAVE_SAMPLES and len(sample_specs) < N_SAMPLES:
+        if SAVE_SAMPLES and len(sample_specs) < N_SAMPLES and y_true.sum() > 0:
             sample_specs.append(x_u8)
             sample_masks.append(y_true)
             sample_preds.append(pred)
