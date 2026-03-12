@@ -30,9 +30,9 @@ from PIL import Image
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-CNN_PATH = "Models/Akida_v1.keras"
-SNN_PATH = "Models/Akida_v1.fbz"     # run convert_to_akida.py first to generate
-TEST_DIR = "Data/Akida_Dataset/Combined_Test"
+CNN_PATH = "Models/V5/Akida_ONNIX_CNN.keras"
+SNN_PATH = "Models/V5/Akida_ONNIX_SNN.fbz"     # run convert_to_akida.py first to generate
+TEST_DIR = "Data/Akida_Full_Dataset/Full_Data_Test"
 N_EVAL   = None   # None = use ALL test samples; set to an int to limit
 
 EPS = 1e-8   # small constant to avoid division by zero (matches convert_to_akida.py)
