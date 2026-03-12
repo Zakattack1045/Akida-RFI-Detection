@@ -46,6 +46,11 @@ E_SYN      = 3e-12    # (Akida)
 # E_SYN      = 26e-12   # Neuromorphic synaptic operation (IBM True North) (Merolla et al. 2014)
 # E_SYN      = 23.6e-12   # (Lava)
 
+# Memory access energy (Joules/byte) — Horowitz 2014 ISSCC.
+# DRAM:  640 pJ per 32-bit word → 640/4 = 160 pJ/byte  (off-chip, worst case)
+# SRAM:    5 pJ per 32-bit word →   5/4 = 1.25 pJ/byte (on-chip, best case)
+E_DRAM_PER_BYTE = 160e-12   # J/byte
+E_SRAM_PER_BYTE = 1.25e-12  # J/byte
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -120,6 +125,7 @@ def layer_fan_out(layer):
 
 # ── CNN analysis ───────────────────────────────────────────────────────────────
 
+
 def count_cnn_macs(model, conv_layers):
     """
     Analytical MAC count per Conv2D layer.
@@ -150,6 +156,56 @@ def count_cnn_active_ops(conv_layers, all_inputs, n_samples):
         active_per_sample = (act > 0).reshape(n_samples, -1).sum(axis=1) * fo
         result[layer.name] = float(active_per_sample.mean())
     return result
+
+
+def compute_cnn_memory_bounds(conv_layers, bits_weights, bits_acts):
+    """
+    Lower and upper bounds on CNN memory access energy per inference.
+
+    Lower bound (ideal on-chip SRAM, perfect reuse):
+        Each weight and activation loaded exactly once.
+        Data moved per layer = weight_bytes + input_act_bytes + output_act_bytes
+        Energy = total_bytes × E_SRAM_PER_BYTE
+        Achievable on a custom ASIC/FPGA with sufficient on-chip SRAM.
+
+    Upper bound (no caching, all-DRAM streaming):
+        Each MAC re-fetches its weight and input activation from DRAM.
+        No spatial reuse of weights across output positions.
+        Data moved per layer = MACs × (bytes_per_weight + bytes_per_act)
+                               + output_act_bytes (written once)
+        Energy = total_bytes × E_DRAM_PER_BYTE
+        Worst case for CPU/GPU without explicit data-reuse management.
+
+    Sub-byte precisions (4 bits = 0.5 bytes) use fractional bytes to represent
+    the amortised cost of packed element pairs (Akida packs two 4-bit values
+    per byte access).
+
+    Returns (e_lower_J, e_upper_J).
+    """
+    bpw = bits_weights / 8.0
+    bpa = bits_acts    / 8.0
+    e_lower = 0.0
+    e_upper = 0.0
+
+    for layer in conv_layers:
+        _, H_out, W_out, C_out = layer.output_shape
+        _, H_in,  W_in,  C_in  = layer.input_shape
+        kH, kW = layer.kernel_size
+
+        macs_layer       = H_out * W_out * C_out * kH * kW * C_in
+        weight_bytes     = kH * kW * C_in * C_out     * bpw
+        input_act_bytes  = H_in  * W_in  * C_in       * bpa
+        output_act_bytes = H_out * W_out * C_out       * bpa
+
+        # Lower: load every element once from on-chip SRAM
+        e_lower += (weight_bytes + input_act_bytes + output_act_bytes) * E_SRAM_PER_BYTE
+
+        # Upper: every MAC re-reads weight + input from DRAM; output written once
+        e_upper += (macs_layer * bpw
+                 +  macs_layer * bpa
+                 +  output_act_bytes) * E_DRAM_PER_BYTE
+
+    return e_lower, e_upper
 
 
 # ── SNN analysis ───────────────────────────────────────────────────────────────
@@ -287,47 +343,98 @@ def print_report(conv_layers, macs, synops_rate, synops_latency, activ_bits, n_e
         f"{int(total_synops_rate):>12,}  {int(total_synops_lat):>12,}"
     )
 
-    e_fp32_theory = total_macs        * E_MAC_FP32
-    e_int8_theory = total_macs        * E_MAC_INT8
-    e_snn_rate    = total_synops_rate * E_SYN
-    e_snn_lat     = total_synops_lat  * E_SYN
-
-    def _uj(e):
-        return f"{e * 1e6:.4f} µJ"
-
-    def _ratio(num, den):
-        return f"{num / den:.1f}×" if den > 1e-30 else "N/A"
-
-    print(f"\n{'─ Energy Per Inference (64×64 image) ':-<{W}}")
-    print(f"  CNN (FP32, theoretical):      {_uj(e_fp32_theory):<14}  [MACs × {E_MAC_FP32*1e12:.2f} pJ]")
-    print(f"  CNN (INT8, theoretical):      {_uj(e_int8_theory):<14}  [MACs × {E_MAC_INT8*1e12:.2f} pJ]")
-    print(f"  SNN (rate-coded estimate):    {_uj(e_snn_rate):<14}  [SynOps_rate × {E_SYN*1e12:.2f} pJ]  ← value = spike count")
-    print(f"    including neuron updates:   {_uj(e_snn_rate*3):<14}  [E_update = 2 × E_syn, assuming 1 timestep per inference]")
-    print(f"  SNN (latency-coded estimate): {_uj(e_snn_lat):<14}  [SynOps_lat  × {E_SYN*1e12:.2f} pJ]  ← one spike per non-zero neuron")
-    print(f"    including neuron updates:   {_uj(e_snn_lat*3):<14}  [E_update = 2 × E_syn, assuming 1 timestep per inference]")
-
-    print(f"\n{'─ Efficiency Ratios ':-<{W}}")
-    for label, e_snn in (("rate-coded  ", e_snn_rate), ("latency-coded", e_snn_lat)):
-        print(f"  SNN ({label}) vs CNN FP32:  {_ratio(e_fp32_theory, e_snn)}")
-        print(f"  SNN ({label}) vs CNN INT8:  {_ratio(e_int8_theory, e_snn)}")
-
     max_possible = sum(macs.get(l.name, 0) * max_spikes for l in conv_layers)
     if max_possible > 0:
         pct_rate = 100.0 * total_synops_rate / max_possible
         pct_lat  = 100.0 * total_synops_lat  / max_possible
-        print(f"  SNN spike activity — rate model    (fraction of max): {pct_rate:.2f}%")
+        print(f"\n  SNN spike activity — rate model    (fraction of max): {pct_rate:.2f}%")
         print(f"  SNN spike activity — latency model (fraction of max): {pct_lat:.2f}%")
 
     print(
         f"\n  Rate model:    activations scaled to [0, {max_spikes}] (ACTIV_BITS={activ_bits}).\n"
         f"  Latency model: counts any non-zero activation as one spike (time-to-first-spike).\n"
         f"  ACTIV_BITS must match convert_to_akida.py for the rate estimate to be valid.\n"
-        f"  Evaluated on {n_eval} test samples.  "
-        f"E_MAC_FP32={E_MAC_FP32*1e12:.2f} pJ  "
-        f"E_MAC_INT8={E_MAC_INT8*1e12:.2f} pJ  "
-        f"E_SYN={E_SYN*1e12:.2f} pJ"
+        f"  Evaluated on {n_eval} test samples."
     )
     print("─" * W)
+
+
+def print_summary(conv_layers, macs, synops_rate, synops_latency, activ_bits, n_eval):
+    """
+    Unified energy summary printed last.
+
+    CNN: FP32 and INT8 compute ops energy alongside SRAM (lower) and DRAM (upper)
+         memory access bounds, giving total lower and upper bounds per inference.
+    SNN: Rate-coded and latency-coded synaptic operation energy alongside neuron
+         update energy (E_update = 2 × E_syn, 1 timestep assumed), giving totals.
+    """
+    W = 96
+
+    total_macs        = sum(macs.values())
+    total_synops_rate = sum(synops_rate.values())
+    total_synops_lat  = sum(synops_latency.values())
+    max_spikes        = (2 ** activ_bits) - 1
+
+    def _uj(e):
+        return f"{e * 1e6:.2f} µJ"
+
+    # ── CNN ──────────────────────────────────────────────────────────────────────
+    e_fp32 = total_macs * E_MAC_FP32
+    e_int8 = total_macs * E_MAC_INT8
+    mem_lo_fp32, mem_hi_fp32 = compute_cnn_memory_bounds(conv_layers, 32, 32)
+    mem_lo_int8, mem_hi_int8 = compute_cnn_memory_bounds(conv_layers,  8,  8)
+
+    # ── SNN ──────────────────────────────────────────────────────────────────────
+    e_syn_rate = total_synops_rate * E_SYN
+    e_upd_rate = e_syn_rate * 2            # E_update = 2 × E_syn, 1 timestep
+    e_syn_lat  = total_synops_lat  * E_SYN
+    e_upd_lat  = e_syn_lat  * 2
+
+    print("\n" + "═" * W)
+    print("ENERGY SUMMARY — per inference (64×64 spectrogram)")
+    print("═" * W)
+
+    # CNN table
+    print(f"\n  CNN  [total MACs: {total_macs:,}]")
+    print(
+        f"  {'Precision':<8}  {'Compute ops':>13}  {'Mem lower (SRAM)':>18}"
+        f"  {'Mem upper (DRAM)':>18}  {'Total lower':>13}  {'Total upper':>13}"
+    )
+    print("  " + "─" * (W - 2))
+    for label, e_comp, mem_lo, mem_hi in (
+        ("FP32", e_fp32, mem_lo_fp32, mem_hi_fp32),
+        ("INT8", e_int8, mem_lo_int8, mem_hi_int8),
+    ):
+        print(
+            f"  {label:<8}  {_uj(e_comp):>13}  {_uj(mem_lo):>18}"
+            f"  {_uj(mem_hi):>18}  {_uj(e_comp + mem_lo):>13}  {_uj(e_comp + mem_hi):>13}"
+        )
+
+    # SNN table
+    print(
+        f"\n  SNN  [E_syn = {E_SYN*1e12:.2f} pJ  |  "
+        f"neuron update = 2 × E_syn  |  1 timestep/inference]"
+    )
+    print(
+        f"  {'Encoding':<16}  {'SynOps energy':>15}  {'Neuron updates':>16}  {'Total':>13}"
+    )
+    print("  " + "─" * (W - 2))
+    for label, e_syn, e_upd in (
+        ("Rate-coded",    e_syn_rate, e_upd_rate),
+        ("Latency-coded", e_syn_lat,  e_upd_lat),
+    ):
+        print(
+            f"  {label:<16}  {_uj(e_syn):>15}  {_uj(e_upd):>16}  {_uj(e_syn + e_upd):>13}"
+        )
+
+    print(
+        f"\n  Memory bounds (Horowitz 2014 ISSCC):\n"
+        f"  • SRAM lower: 1.25 pJ/byte (5 pJ / 32-bit word) "
+        f"— ideal on-chip scratchpad, each weight/activation loaded exactly once\n"
+        f"  • DRAM upper: 160 pJ/byte (640 pJ / 32-bit word) "
+        f"— no caching, every MAC re-fetches weight and input activation from off-chip DRAM"
+    )
+    print("═" * W)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -368,6 +475,10 @@ def main():
     # 7. Print full comparison report
     print_report(conv_layers, macs, synops_rate, synops_latency,
                  ACTIV_BITS, len(x_float))
+
+    # 8. Unified energy summary (CNN compute + memory bounds; SNN synops + neuron updates)
+    print_summary(conv_layers, macs, synops_rate, synops_latency,
+                  ACTIV_BITS, len(x_float))
 
 
 if __name__ == "__main__":

@@ -26,11 +26,13 @@ HEIGHT = 64
 WIDTH  = 64
 
 SPLITS = {
-    "Combined_Dataset": "Data/OUTPUTS/Combined_Dataset",
-    "Combined_Test":    "Data/OUTPUTS/Combined_Test",
+    "Full_Data_Train": "Data/Full_Data_Train",
+    "Full_Data_Validate": "Data/Full_Data_Validate",
+    "Full_Data_Test":    "Data/Full_Data_Test",
+
 }
 
-OUTPUT_ROOT = "Data/Akida_Dataset"
+OUTPUT_ROOT = "Data/Akida_Full_Dataset"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
