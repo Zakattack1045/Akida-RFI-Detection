@@ -23,9 +23,9 @@ from PIL import Image
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-DATASET_ROOT = "Data/Akida_Dataset"
-TRAIN_SPLIT  = "Combined_Dataset"
-TEST_SPLIT   = "Combined_Test"
+DATASET_ROOT = "Data/Akida_Full_Dataset"
+TRAIN_SPLIT  = "Full_Data_Train"
+VAL_SPLIT   = "Full_Data_Validate"
 
 INPUT_H = 64
 INPUT_W = 64
@@ -33,13 +33,13 @@ OUT_H   = INPUT_H
 OUT_W   = INPUT_W
 
 BATCH_SIZE   = 8
-EPOCHS       = 5
+EPOCHS       = 45
 STEPS_EPOCH  = 244   # ceil(1950 / 8)
 VAL_STEPS    = 13    # ceil(100 / 8)
 
-MODEL_SAVE_ROOT = "Models/V3"
-MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_ROOT,"Akida_ONNIX.keras")
-ONNX_SAVE_PATH  = os.path.join(MODEL_SAVE_ROOT,"Akida_ONNIX.onnx")
+MODEL_SAVE_ROOT = "Models/V5"
+MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_ROOT,"Akida_ONNIX_CNN.keras")
+ONNX_SAVE_PATH  = os.path.join(MODEL_SAVE_ROOT,"Akida_ONNIX_CNN.onnx")
 
 # Sample image saving
 SAVE_SAMPLES = True
@@ -295,7 +295,7 @@ def main():
     print(f"Dataset: {DATASET_ROOT}")
 
     train_ds = make_dataset(DATASET_ROOT, TRAIN_SPLIT, OUT_H, OUT_W, BATCH_SIZE, shuffle=True)
-    val_ds   = make_dataset(DATASET_ROOT, TEST_SPLIT,  OUT_H, OUT_W, BATCH_SIZE, shuffle=False)
+    val_ds   = make_dataset(DATASET_ROOT, VAL_SPLIT,  OUT_H, OUT_W, BATCH_SIZE, shuffle=False)
 
     model = build_model(INPUT_H, INPUT_W)
     model.compile(
@@ -347,13 +347,14 @@ def main():
     # Save sample visualisations
     if SAVE_SAMPLES:
         print(f"\nGenerating {N_SAMPLES} sample images ...")
-        gen = _load_split_generator(DATASET_ROOT, TEST_SPLIT, OUT_H, OUT_W)
+        gen = _load_split_generator(DATASET_ROOT, VAL_SPLIT, OUT_H, OUT_W)
         sample_specs, sample_masks = [], []
-        for spec_arr, mask in gen:
-            sample_specs.append(spec_arr)
-            sample_masks.append(mask)
-            if len(sample_specs) >= N_SAMPLES:
-                break
+        for i, (spec_arr, mask) in enumerate(gen):
+            if i % 40 == 0:
+                sample_specs.append(spec_arr)
+                sample_masks.append(mask)
+                if len(sample_specs) >= N_SAMPLES:
+                    break
 
         x = np.array(sample_specs, dtype=np.float32)
         y = np.array(sample_masks, dtype=np.int32)

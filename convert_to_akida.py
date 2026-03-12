@@ -13,10 +13,13 @@ from PIL import Image
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-MODEL_PATH   = "Models/Akida_v1.keras"
-TRAIN_DIR    = "Data/Akida_Dataset/Combined_Dataset"  # training data for QAT
-TEST_DIR     = "Data/Akida_Dataset/Combined_Test"
-AKIDA_SAVE   = "Models/Akida_v1.fbz"
+DATASET_ROOT = "Data/Akida_Full_Dataset"
+TRAIN_SPLIT  = os.path.join(DATASET_ROOT,"Full_Data_Train")
+TEST_SPLIT   = os.path.join(DATASET_ROOT,"Full_Data_Test")
+
+MODEL_ROOT   = "Models/V6"
+MODEL_PATH   = os.path.join(MODEL_ROOT,"Akida_CNN.keras")
+AKIDA_SAVE   = os.path.join(MODEL_ROOT,"Akida_V1_SNN.fbz")
 
 INPUT_H = 64
 INPUT_W = 64
@@ -40,7 +43,7 @@ QAT_BATCH   = 8
 # for the first N_SAMPLES test images after evaluation.
 SAVE_SAMPLES = True
 N_SAMPLES    = 8
-SAMPLES_DIR  = "Samples/Akida"
+SAMPLES_DIR  = os.path.join(MODEL_ROOT,"Samples/Akida")
 
 
 # ── Loss (mirrors train_akida.py) ──────────────────────────────────────────────
@@ -83,9 +86,9 @@ def load_test_sample(spec_path, mask_path):
     return spec, mask_raw
 
 
-def collect_test_paths(test_dir):
-    spec_dir = os.path.join(test_dir, "spectrograms")
-    mask_dir = os.path.join(test_dir, "masks")
+def collect_test_paths(TEST_SPLIT):
+    spec_dir = os.path.join(TEST_SPLIT, "spectrograms")
+    mask_dir = os.path.join(TEST_SPLIT, "masks")
     fnames = sorted(f for f in os.listdir(spec_dir) if f.lower().endswith(".png"))
     pairs = [
         (os.path.join(spec_dir, f), os.path.join(mask_dir, f))
@@ -95,13 +98,13 @@ def collect_test_paths(test_dir):
     return pairs
 
 
-def load_train_data_for_qat(train_dir):
+def load_train_data_for_qat(TRAIN_SPLIT):
     """
     Load all training spectrograms and masks as numpy arrays for QAT fine-tuning.
     Spectrograms are float32 normalised to [0, 1], matching train_akida.py.
     """
-    spec_dir = os.path.join(train_dir, "spectrograms")
-    mask_dir = os.path.join(train_dir, "masks")
+    spec_dir = os.path.join(TRAIN_SPLIT, "spectrograms")
+    mask_dir = os.path.join(TRAIN_SPLIT, "masks")
     fnames = sorted(f for f in os.listdir(spec_dir) if f.lower().endswith(".png"))
 
     specs, masks = [], []
@@ -182,6 +185,7 @@ def evaluate(akida_model, test_pairs):
     total_pixels = 0
     correct = 0
     tp = fp = tn = fn = 0
+    eval_index = 0
 
     # Collect samples for optional visualisation
     sample_specs, sample_masks, sample_preds = [], [], []
@@ -199,10 +203,12 @@ def evaluate(akida_model, test_pairs):
         tn += ((pred == 0) & (y_true == 0)).sum()
         fn += ((pred == 0) & (y_true == 1)).sum()
 
-        if SAVE_SAMPLES and len(sample_specs) < N_SAMPLES and y_true.sum() > 0:
+        if SAVE_SAMPLES and len(sample_specs) < N_SAMPLES and (eval_index % 30 == 0):
             sample_specs.append(x_u8)          # (1, H, W, 1) uint8
             sample_masks.append(y_true)
             sample_preds.append(pred)
+        
+        eval_index += 1
 
     accuracy    = correct / total_pixels
     precision   = tp / (tp + fp + 1e-8)
@@ -261,8 +267,8 @@ def main():
     # Fine-tuning the quantized model lets weights adapt to the quantization grid,
     # dramatically reducing the accuracy drop versus post-training quantization alone.
     if QAT_EPOCHS > 0:
-        print(f"\nLoading training data for QAT from {TRAIN_DIR} ...")
-        x_train, y_train = load_train_data_for_qat(TRAIN_DIR)
+        print(f"\nLoading training data for QAT from {TRAIN_SPLIT} ...")
+        x_train, y_train = load_train_data_for_qat(TRAIN_SPLIT)
         print(f"Loaded {len(x_train)} training samples.")
 
         q_model.compile(
@@ -286,8 +292,8 @@ def main():
     print(akida_model.summary())
 
     # 6) Evaluate on real test set
-    print(f"\nLoading test data from {TEST_DIR} ...")
-    test_pairs = collect_test_paths(TEST_DIR)
+    print(f"\nLoading test data from {TEST_SPLIT} ...")
+    test_pairs = collect_test_paths(TEST_SPLIT)
     print(f"Found {len(test_pairs)} test samples.")
 
     print("Running inference ...")

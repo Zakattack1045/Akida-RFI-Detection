@@ -28,9 +28,9 @@ from PIL import Image
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-DATASET_ROOT = "Data/Akida_Dataset"
-TRAIN_SPLIT  = "Combined_Dataset"
-TEST_SPLIT   = "Combined_Test"
+DATASET_ROOT = "Data/Akida_Full_Dataset"
+TRAIN_SPLIT  = "Full_Data_Train"
+VAL_SPLIT   = "Full_Data_Validate"
 
 INPUT_H = 64    # Spectrogram input height (from prepare_dataset.py)
 INPUT_W = 64    # Spectrogram input width
@@ -40,12 +40,12 @@ OUT_H = INPUT_H
 OUT_W = INPUT_W
 
 BATCH_SIZE   = 8
-EPOCHS       = 30
+EPOCHS       = 45
 STEPS_EPOCH  = 244   # ceil(1950 train samples / batch 8)
 VAL_STEPS    = 13    # ceil(100 test samples / batch 8)
 
-MODEL_SAVE_ROOT = "Models/V2/"
-MODEL_SAVE_NAME = "Akida_v2.keras"
+MODEL_SAVE_ROOT = "Models/V6/"
+MODEL_SAVE_NAME = "Akida_CNN.keras"
 
 # Sample image saving
 # Set SAVE_SAMPLES = True to save visualisation PNGs after training.
@@ -300,7 +300,7 @@ def main():
         DATASET_ROOT, TRAIN_SPLIT, OUT_H, OUT_W, BATCH_SIZE, shuffle=True
     )
     val_ds = make_dataset(
-        DATASET_ROOT, TEST_SPLIT, OUT_H, OUT_W, BATCH_SIZE, shuffle=False
+        DATASET_ROOT, VAL_SPLIT, OUT_H, OUT_W, BATCH_SIZE, shuffle=False
     )
 
     model = build_model(INPUT_H, INPUT_W)
@@ -341,13 +341,14 @@ def main():
 
     if SAVE_SAMPLES:
         print(f"\nGenerating {N_SAMPLES} sample images ...")
-        gen = _load_split_generator(DATASET_ROOT, TEST_SPLIT, OUT_H, OUT_W)
+        gen = _load_split_generator(DATASET_ROOT, VAL_SPLIT, OUT_H, OUT_W)
         sample_specs, sample_masks = [], []
-        for spec, mask in gen:
-            sample_specs.append(spec)
-            sample_masks.append(mask)
-            if len(sample_specs) >= N_SAMPLES:
-                break
+        for i, (spec, mask) in enumerate(gen):
+            if (i % 40 == 0):
+                sample_specs.append(spec)
+                sample_masks.append(mask)
+                if len(sample_specs) >= N_SAMPLES:
+                    break
 
         x = np.array(sample_specs, dtype=np.float32)   # (N, H, W, 1)
         y = np.array(sample_masks, dtype=np.int32)      # (N, H, W)

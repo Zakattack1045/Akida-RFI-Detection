@@ -29,11 +29,14 @@ from quantizeml.models import quantize, QuantizationParams
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-MODEL_SAVE_ROOT = "Models/V3"
-ONNX_MODEL_PATH = os.path.join(MODEL_SAVE_ROOT,"Akida_ONNIX.onnx")
-TRAIN_DIR       = "Data/Akida_Dataset/Combined_Dataset"
-TEST_DIR        = "Data/Akida_Dataset/Combined_Test"
-AKIDA_SAVE      = os.path.join(MODEL_SAVE_ROOT,"Akida_ONNIX.fbz")
+MODEL_SAVE_ROOT = "Models/V5"
+ONNX_MODEL_PATH = os.path.join(MODEL_SAVE_ROOT,"Akida_ONNIX_CNN.onnx")
+
+DATASET_ROOT    = "Data/Akida_Full_Dataset"
+TRAIN_DIR       = os.path.join(DATASET_ROOT,"Full_Data_Train")
+TEST_DIR        = os.path.join(DATASET_ROOT,"Full_Data_Test")
+
+AKIDA_SAVE      = os.path.join(MODEL_SAVE_ROOT,"Akida_ONNIX_SNN.fbz")
 
 INPUT_H = 64
 INPUT_W = 64
@@ -149,6 +152,7 @@ def evaluate(akida_model, test_pairs):
     total_pixels = 0
     correct = 0
     tp = fp = tn = fn = 0
+    eval_index =0
 
     sample_specs, sample_masks, sample_preds = [], [], []
 
@@ -164,11 +168,13 @@ def evaluate(akida_model, test_pairs):
         fp += ((pred == 1) & (y_true == 0)).sum()
         tn += ((pred == 0) & (y_true == 0)).sum()
         fn += ((pred == 0) & (y_true == 1)).sum()
-
-        if SAVE_SAMPLES and len(sample_specs) < N_SAMPLES and y_true.sum() > 0:
+        if (eval_index % 40 == 0) : print(f'Ya, works {eval_index}, {y_true.sum()}')
+        if SAVE_SAMPLES and len(sample_specs) < N_SAMPLES and (eval_index % 40 == 0):
             sample_specs.append(x_u8)
             sample_masks.append(y_true)
             sample_preds.append(pred)
+
+        eval_index+=1
 
     accuracy    = correct / total_pixels
     precision   = tp / (tp + fp + 1e-8)
