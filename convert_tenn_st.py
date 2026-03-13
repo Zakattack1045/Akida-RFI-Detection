@@ -1,37 +1,37 @@
 # ============================
 # convert_tenn_st.py
-# PURPOSE: Quantize the TENN ONNX model (from train_tenn_st.py) and evaluate
-#          using ONNX Runtime with FIFO streaming inference.
+# PURPOSE: Quantize the TENN ONNX model (from train_tenn_st.py), convert to an
+#          Akida SNN, evaluate with FIFO streaming inference, and save the model.
 #
 # Pipeline:
 #   1. Load ONNX model — tenns_modules.export_to_onnx already bufferizes temporal
 #      convolutions during export, so input shape is (B, 1, H, W) per frame (4D).
 #   2. Load calibration frames: (N, 1, H, W) float32 [0,1] — individual frames.
 #   3. quantizeml.quantize() — quantizes weights/activations (bufferization already done).
-#   4. Save quantized ONNX.
-#   5. Evaluate with ONNX Runtime:
-#        for each test sequence: reset_buffers → feed T frames → argmax last output.
-#   6. Print metrics.
+#   4. cnn2snn.convert() — produce Akida SNN.
+#   5. Evaluate on test sequences:
+#        for each sequence: reset_states → feed T frames → argmax last output.
+#   6. Save Akida model to .fbz.
 # ============================
 
 import os
 import numpy as np
 from PIL import Image
 
+import cnn2snn
 import onnx
-from quantizeml.models import quantize, reset_buffers
+from quantizeml.models import quantize
 from quantizeml.layers import QuantizationParams
-from onnxruntime import InferenceSession, SessionOptions
-from onnxruntime_extensions import get_library_path
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-MODEL_SAVE_ROOT  = "Models/V4"
-ONNX_TRAIN_PATH  = os.path.join(MODEL_SAVE_ROOT, "Akida_tenn_train.onnx")
-ONNX_QUANT_PATH  = os.path.join(MODEL_SAVE_ROOT, "Akida_tenn_quant.onnx")
-TRAIN_DIR        = "Data/Akida_Dataset/Combined_Dataset"
-TEST_DIR         = "Data/Akida_Dataset/Combined_Test"
+MODEL_SAVE_ROOT  = "Models/V7"
+ONNX_TRAIN_PATH  = os.path.join(MODEL_SAVE_ROOT, "Akida_tenn_CNN.onnx")
+AKIDA_SAVE_PATH  = os.path.join(MODEL_SAVE_ROOT, "Akida_tenn_SNN.fbz")
+DATASET_ROOT     = "Data/Akida_Full_Dataset"
+TRAIN_DIR        = os.path.join(DATASET_ROOT,"Full_Data_Train")
+TEST_DIR         = os.path.join(DATASET_ROOT,"Full_Data_Test")
 
 INPUT_H = 64
 INPUT_W = 64
@@ -91,14 +91,10 @@ def collect_test_sequences(test_dir, seq_len):
     return sequences
 
 
-def load_frame_float(spec_path):
-    """
-    Load spectrogram as (1, 1, H, W) float32 [0,1] for ONNX Runtime inference.
-    The quantized ONNX session interface expects float32 input; input_dtype='int8'
-    in QuantizationParams configures internal quantization only, not the external type.
-    """
-    arr = np.array(Image.open(spec_path).convert("L"), dtype=np.float32) / 255.0
-    return arr[np.newaxis, np.newaxis, ...]   # (1, 1, H, W)
+def load_frame_uint8(spec_path):
+    """Load spectrogram as (1, H, W, 1) uint8 for Akida inference (NHWC format)."""
+    arr = np.array(Image.open(spec_path).convert("L"), dtype=np.int8)
+    return arr[np.newaxis, np.newaxis, ...]   # (1, H, W, 1)
 
 
 def load_mask(mask_path):
@@ -118,18 +114,18 @@ def load_mask(mask_path):
 
 # ── Visualisation ──────────────────────────────────────────────────────────────
 
-def save_sample_images(frames_f32, masks, preds, save_dir, prefix="sample"):
+def save_sample_images(frames_u8, masks, preds, save_dir, prefix="sample"):
     """
-    frames_f32: (N, 1, 1, H, W) float32 [0,1] — last frame fed to ONNX Runtime
-    masks:      (N, H, W)        int32
-    preds:      (N, H, W)        int
+    frames_u8: (N, 1, 1, H, W) int8   — last frame fed to Akida (NCHW format, batch+channel dims)
+    masks:     (N, H, W)        int32
+    preds:     (N, H, W)        int
     """
     import matplotlib.pyplot as plt
 
     os.makedirs(save_dir, exist_ok=True)
 
-    for i in range(len(frames_f32)):
-        spec_img = frames_f32[i, 0, 0]   # already float32 [0,1]
+    for i in range(len(frames_u8)):
+        spec_img = frames_u8[i, 0, 0].astype(np.float32) / 127.0  # (H, W), int8 → [0,1]
         mask     = masks[i]
         pred     = preds[i]
 
@@ -153,36 +149,35 @@ def save_sample_images(frames_f32, masks, preds, save_dir, prefix="sample"):
 
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
-def evaluate(sess, input_name, q_model, test_sequences):
+def evaluate(akida_model, test_sequences):
     """
-    Streaming evaluation: for each sequence reset FIFO, warm up T-1 frames,
-    predict on last frame.
+    Streaming evaluation: for each sequence reset Akida state, feed T frames
+    one at a time, take the prediction from the last frame's output.
 
-    Post-bufferization ONNX output shape: (B, 2, H, W) — NCHW PyTorch format.
-    argmax on axis=1 (class dimension).
+    Akida output shape: (1, H, W, 2) — NHWC, argmax on axis=-1 (class dim).
     """
     total_pixels = 0
     correct = 0
     tp = fp = tn = fn = 0
+    eval_index = 0
 
     sample_frames, sample_masks, sample_preds = [], [], []
 
     for seq in test_sequences:
-        # Reset FIFO buffers between sequences
-        reset_buffers(q_model)
+        # No state reset needed: T-1 warm-up frames flush the FIFO such that
+        # the prediction frame sees exactly [curr_0 .. curr_T-1] as context.
 
         # Warm-up: feed frames 0 .. T-2
         for spec_path, _ in seq[:-1]:
-            frame_i8 = load_frame_float(spec_path)
-            sess.run(None, {input_name: frame_i8})
+            akida_model.predict(load_frame_uint8(spec_path))
 
         # Predict on last frame
         last_spec_path, last_mask_path = seq[-1]
-        frame_i8 = load_frame_float(last_spec_path)
+        frame_u8 = load_frame_uint8(last_spec_path)
         y_true   = load_mask(last_mask_path)
 
-        logits = sess.run(None, {input_name: frame_i8})[0]  # (1, 2, H, W)
-        pred   = np.argmax(logits, axis=1)[0]               # (H, W) — argmax on class dim
+        logits = akida_model.predict(frame_u8)      # (1, H, W, 2)
+        pred   = np.argmax(logits, axis=-1)[0]      # (H, W)
 
         total_pixels += y_true.size
         correct      += (pred == y_true).sum()
@@ -191,10 +186,11 @@ def evaluate(sess, input_name, q_model, test_sequences):
         tn += ((pred == 0) & (y_true == 0)).sum()
         fn += ((pred == 0) & (y_true == 1)).sum()
 
-        if SAVE_SAMPLES and len(sample_frames) < N_SAMPLES and y_true.sum() > 0:
-            sample_frames.append(frame_i8)
+        if SAVE_SAMPLES and len(sample_frames) < N_SAMPLES and eval_index % 5 == 0:
+            sample_frames.append(frame_u8)
             sample_masks.append(y_true)
             sample_preds.append(pred)
+        eval_index += 1
 
     accuracy    = correct / total_pixels
     precision   = tp / (tp + fp + 1e-8)
@@ -213,7 +209,7 @@ def evaluate(sess, input_name, q_model, test_sequences):
         print(f"\nSaving {len(sample_frames)} sample images to {SAMPLES_DIR} ...")
         save_sample_images(
             np.array(sample_frames), np.array(sample_masks), np.array(sample_preds),
-            SAMPLES_DIR, prefix="tenn_quant"
+            SAMPLES_DIR, prefix="tenn_akida"
         )
 
     return metrics
@@ -222,20 +218,17 @@ def evaluate(sess, input_name, q_model, test_sequences):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    # 1) Load training ONNX model (input: (B,1,T,H,W))
+    # 1) Load training ONNX model (bufferized: input shape (B, 1, H, W) per frame)
     print(f"Loading ONNX model from {ONNX_TRAIN_PATH} ...")
     onnx_model = onnx.load(ONNX_TRAIN_PATH)
     print("ONNX model loaded.")
 
     # 2) Load calibration frames: (N, 1, H, W) float32 [0,1]
-    # The ONNX is already bufferized (4D input), so individual frames are used.
     print(f"\nLoading {N_CALIB} calibration frames from {TRAIN_DIR} ...")
     calib_samples = load_calibration_frames(TRAIN_DIR, N_CALIB)
     print(f"Calibration data: shape={calib_samples.shape}, dtype={calib_samples.dtype}")
 
-    # 3) Quantize
-    # The model is already bufferized (FIFO ops in place from export_to_onnx).
-    # quantize() only needs to calibrate activation ranges and quantize weights.
+    # 3) Quantize (FIFO ops already in place from export_to_onnx)
     print("\nQuantizing ONNX model ...")
     qparams = QuantizationParams(per_tensor_activations=True, input_dtype="int8")
     q_model = quantize(
@@ -245,32 +238,21 @@ def main():
         batch_size=8,
         samples=calib_samples,
     )
-    print("Quantization and bufferization complete.")
+    print("Quantization complete.")
 
-    # 4) Save quantized ONNX
-    onnx.save(q_model, ONNX_QUANT_PATH)
-    print(f"Saved quantized model to {ONNX_QUANT_PATH}")
+    # 4) Convert to Akida model
+    print("\nConverting to Akida model ...")
+    akida_model = cnn2snn.convert(q_model)
+    print("Akida model created.")
+    print(akida_model.summary())
 
-    # 5) Create ONNX Runtime session with custom FIFO ops (onnxruntime-extensions)
-    print("\nCreating ONNX Runtime inference session ...")
-    sess_opts = SessionOptions()
-    sess_opts.register_custom_ops_library(get_library_path())
-    sess = InferenceSession(
-        ONNX_QUANT_PATH,
-        sess_options=sess_opts,
-        providers=["CPUExecutionProvider"],
-    )
-    input_name = sess.get_inputs()[0].name
-    print(f"Session ready. Input name: '{input_name}'  "
-          f"Input shape: {sess.get_inputs()[0].shape}")
-
-    # 6) Evaluate
+    # 5) Evaluate on test sequences
     print(f"\nLoading test sequences from {TEST_DIR} ...")
     test_sequences = collect_test_sequences(TEST_DIR, SEQUENCE_LEN)
     print(f"Found {len(test_sequences)} test sequences ({SEQUENCE_LEN} frames each).")
 
-    print("Running streaming inference (reset FIFO → warm-up → predict last frame) ...")
-    metrics = evaluate(sess, input_name, q_model, test_sequences)
+    print("Running streaming inference (warm-up T-1 frames → predict last frame) ...")
+    metrics = evaluate(akida_model, test_sequences)
 
     print("\n── Results ───────────────────────────────────")
     print(f"  Accuracy:    {metrics['accuracy']:.4f}")
@@ -280,6 +262,10 @@ def main():
     print(f"  IoU (RFI):   {metrics['iou']:.4f}")
     print(f"  Specificity: {metrics['specificity']:.4f}")
     print(f"  TP={metrics['tp']}  FP={metrics['fp']}  TN={metrics['tn']}  FN={metrics['fn']}")
+
+    # 6) Save Akida model
+    akida_model.save(AKIDA_SAVE_PATH)
+    print(f"\nSaved Akida model to {AKIDA_SAVE_PATH}")
 
 
 if __name__ == "__main__":

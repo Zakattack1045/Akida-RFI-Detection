@@ -28,9 +28,9 @@ from tenns_modules import SpatioTemporalBlock, export_to_onnx
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-DATASET_ROOT = "Data/Akida_Dataset"
-TRAIN_SPLIT  = "Combined_Dataset"
-TEST_SPLIT   = "Combined_Test"
+DATASET_ROOT = "Data/Akida_Full_Dataset"
+TRAIN_SPLIT  = "Full_Data_Train"
+VAL_SPLIT   = "Full_Data_Validate"
 
 INPUT_H = 64
 INPUT_W = 64
@@ -38,11 +38,11 @@ INPUT_W = 64
 SEQUENCE_LEN = 4    # temporal window (FIFO size after bufferization)
 
 BATCH_SIZE = 8
-EPOCHS     = 3
+EPOCHS     = 45
 LR         = 1e-3
 
-MODEL_SAVE_ROOT = "Models/V4"
-ONNX_SAVE_PATH  = os.path.join(MODEL_SAVE_ROOT, "Akida_tenn_train.onnx")
+MODEL_SAVE_ROOT = "Models/V7"
+ONNX_SAVE_PATH  = os.path.join(MODEL_SAVE_ROOT, "Akida_tenn_CNN.onnx")
 
 SAVE_SAMPLES = True
 N_SAMPLES    = 8
@@ -237,7 +237,7 @@ def main():
     print(f"Input: {INPUT_H}x{INPUT_W}  Sequence length: {SEQUENCE_LEN}")
 
     train_ds = RFISequenceDataset(DATASET_ROOT, TRAIN_SPLIT, SEQUENCE_LEN)
-    val_ds   = RFISequenceDataset(DATASET_ROOT, TEST_SPLIT,  SEQUENCE_LEN)
+    val_ds   = RFISequenceDataset(DATASET_ROOT, VAL_SPLIT,  SEQUENCE_LEN)
     print(f"Train sequences: {len(train_ds)}  Val sequences: {len(val_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
@@ -288,19 +288,20 @@ def main():
         sample_frames, sample_masks, sample_preds = [], [], []
 
         with torch.no_grad():
-            for frames, mask in val_ds:
-                logits = model(frames.unsqueeze(0))         # (1, 2, T, H, W)
-                logits_last = logits[0, :, -1, :, :]       # (2, H, W)
-                pred = logits_last.argmax(dim=0).numpy()    # (H, W)
+            for i, (frames, mask) in enumerate(val_ds):
+                if i % 5 == 0:
+                    logits = model(frames.unsqueeze(0))         # (1, 2, T, H, W)
+                    logits_last = logits[0, :, -1, :, :]       # (2, H, W)
+                    pred = logits_last.argmax(dim=0).numpy()    # (H, W)
 
-                if mask.sum() == 0:   # skip empty-mask (no RFI) frames
-                    continue
-                sample_frames.append(frames)
-                sample_masks.append(mask)
-                sample_preds.append(pred)
+                    if mask.sum() == 0:   # skip empty-mask (no RFI) frames
+                        continue
+                    sample_frames.append(frames)
+                    sample_masks.append(mask)
+                    sample_preds.append(pred)
 
-                if len(sample_frames) >= N_SAMPLES:
-                    break
+                    if len(sample_frames) >= N_SAMPLES:
+                        break
 
         save_sample_images(sample_frames, sample_masks, sample_preds,
                            SAMPLES_DIR, prefix="tenn_cnn")
